@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "gyver-adapters"
+version = "0.1.0"
+description = ""
+authors = ["Gustavo Correa <self.gustavocorrea@gmail.com>"]
+readme = "README.md"
+packages = [{include = "gyver"}]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+asyncpg = {version = "^0.27.0", optional = true}
+asyncmy = {version = "^0.2.7", optional = true}
+aiomysql = {version = "^0.1.1", optional = true}
+gyver = "^2.0.2"
+typing-extensions = "^4.5.0"
+
+
+[tool.poetry.group.lint.dependencies]
+black = "^23.1.0"
+flake8 = "^6.0.0"
+isort = "^5.12.0"
+autoflake = "^2.0.1"
+
+[tool.poetry.extras]
+asyncpg = ["asyncpg"]
+asyncmy = ["asyncmy"]
+aiomysql = ["aiomysql"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
