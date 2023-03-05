@@ -29,4 +29,4 @@ def make_uri(config: DatabaseConfig, port: int, scheme: str) -> str:
         username=config.user,
         password=config.password,
     )
-    return url.set(netloc_args=netloc).encode()
+    return url.set(netloc_args=netloc).add(path=config.name).encode()

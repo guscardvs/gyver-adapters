@@ -1,0 +1,27 @@
+FROM python:3.10-slim as base
+
+RUN apt-get update && \
+    apt-get install -y libpq-dev
+
+FROM base as dependencies
+
+WORKDIR /var/www/
+
+RUN pip install -U pip poetry
+
+COPY poetry.lock pyproject.toml README.md ./
+
+RUN poetry config virtualenvs.in-project true
+RUN mkdir gyver && touch gyver/__init__.py
+
+RUN poetry install --all-extras
+
+FROM base
+
+WORKDIR /var/www/
+COPY --from=dependencies /var/www/.venv ./.venv
+COPY . .
+
+ENV PATH="/var/www/.venv/bin:${PATH}"
+
+ENTRYPOINT python waitdb.py && pytest tests

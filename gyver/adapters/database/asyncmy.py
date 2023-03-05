@@ -1,20 +1,92 @@
-from typing import Optional, Sequence, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Coroutine,
+    Optional,
+    Protocol,
+    Sequence,
+    TypeVar,
+)
 
-import asyncpg
-from asyncpg.connection import Connection
-from asyncpg.pool import Pool
-from asyncpg.protocol import Record
-from asyncpg.transaction import Transaction
+import asyncmy
+from asyncmy.connection import Connection
+from asyncmy.pool import Pool
+from asyncmy.cursors import Cursor
+
 
 from gyver.attrs import define, info
-from gyver.context import AsyncContext, AtomicAsyncAdapter, atomic
+from gyver.context import AsyncContext, AtomicAsyncAdapter
 from gyver.utils import lazyfield
 
-from .config import DatabaseConfig, db_config_factory, make_uri
+from .config import DatabaseConfig, db_config_factory
 
-RecordT = TypeVar("RecordT", bound=Record)
+CursorT = TypeVar("CursorT", bound=Cursor, covariant=True)
 
-DEFAULT_PORT = 5432
+DEFAULT_PORT = 3306
+
+
+class CursorContext(Protocol[CursorT]):
+    def __await__(self) -> CursorT:
+        ...
+
+    async def __aenter__(self) -> CursorT:
+        ...
+
+    async def __aexit__(self, exc_type, exc, tb) -> ...:
+        ...
+
+
+@define
+class AsyncmyTransaction:
+    conn: Connection
+    nested: bool
+
+    async def rollback(self):
+        pass
+
+    async def commit(self):
+        pass
+
+
+class RootTransaction(AsyncmyTransaction):
+    def __init__(self, conn: Connection):
+        super().__init__(conn, False)
+
+    async def begin(self):
+        async with self.conn.cursor() as cur:
+            await cur.execute("BEGIN")
+
+    async def commit(self):
+        async with self.conn.cursor() as cur:
+            await cur.execute("COMMIT")
+
+    async def rollback(self):
+        async with self.conn.cursor() as cur:
+            await cur.execute("ROLLBACK")
+
+
+@define
+class NestedTransaction(AsyncmyTransaction):
+    count: int
+
+    def __init__(self, conn: Connection, count: int):
+        self.__gattrs_init__(conn, True, count)  # type: ignore
+
+    @lazyfield
+    def name(self):
+        return f"aiomysql_sa_savepoint_{self.count}"
+
+    async def begin(self):
+        async with self.conn.cursor() as cur:
+            await cur.execute(f"SAVEPOINT {self.name}")
+
+    async def commit(self):
+        async with self.conn.cursor() as cur:
+            await cur.execute(f"RELEASE SAVEPOINT {self.name}")
+
+    async def rollback(self):
+        async with self.conn.cursor() as cur:
+            await cur.execute(f"ROLLBACK TO SAVEPOINT {self.name}")
 
 
 @define
@@ -23,18 +95,23 @@ class ConnectionProxy:
     A proxy class that provides a simple interface for managing transactions and
     executing SQL queries on a database connection.
 
-    :param conn: the underlying `asyncpg.Connection` object to proxy.
+    :param conn: the underlying `aiomysql.Connection` object to proxy.
 
-    :ivar conn: the underlying `asyncpg.Connection` object that is being proxied.
-    :ivar transaction_stack: a list of `asyncpg.Transaction` that have been
-    started on the underlying `asyncpg.Connection`.
+    :ivar conn: the underlying `aiomysql.Connection` object that is being proxied.
+    :ivar transaction_stack: a list of `Transaction` that have been
+    started on the underlying `aiomysql.Connection`.
     """
 
     conn: Connection
-    transaction_stack: list[Transaction]
+    releaser: Callable[[Connection], Coroutine[None, None, None]]
+    transaction_stack: list[AsyncmyTransaction]
 
-    def __init__(self, conn: Connection) -> None:
-        self.__gattrs_init__(conn, [])  # type: ignore
+    def __init__(
+        self,
+        conn: Connection,
+        releaser: Callable[[Connection], Coroutine[None, None, None]],
+    ) -> None:
+        self.__gattrs_init__(conn, releaser, [])  # type: ignore
 
     @lazyfield
     def _is_closed(self):
@@ -56,15 +133,19 @@ class ConnectionProxy:
             for trx in reversed(self.transaction_stack):
                 await trx.rollback()
             self.transaction_stack.clear()
-        await self.conn.close()
+        await self.releaser(self.conn)
         ConnectionProxy._is_closed.manual_set(self, True)
 
     async def transaction(self):
         """
         Starts a new transaction on the underlying `Connection`.
         """
-        trx = self.conn.transaction()
-        await trx.start()
+        trx = (
+            NestedTransaction(self.conn, len(self.transaction_stack) + 1)
+            if self.transaction_stack
+            else RootTransaction(self.conn)
+        )
+        await trx.begin()
         self.transaction_stack.append(trx)
 
     async def commit(self):
@@ -96,35 +177,25 @@ class ConnectionProxy:
 
     def cursor(
         self,
-        query: str,
-        *args,
-        prefetch: Optional[int] = None,
-        timeout: Optional[float] = None,
-        record_class: Optional[type[Record]] = None,
-    ):
+        cursor_class: type[CursorT] = Cursor,
+    ) -> CursorContext[CursorT]:
         """
-        Creates a cursor object that can be used to iterate over the rows of the result.
+        Creates a cursor object that can be used to execute sqlqueries.
 
         :param query: the SQL query to execute.
         :param args: the parameters to pass to the SQL query.
         :param prefetch: the number of rows to prefetch from the database.
         :param timeout: the number of seconds to wait before timing out the SQL query.
         :param record_class: the record class to use for the results of the SQL query.
-        :return: a new cursor object that can be used to iterate over the rows of the result.
+        :return: a new cursor object that can be used to execute sqlqueries.
         """
-        return self.conn.cursor(
-            query,
-            *args,
-            prefetch=prefetch,
-            timeout=timeout,
-            record_class=record_class,
-        )
+
+        return self.conn.cursor(cursor_class)
 
     async def execute(
         self,
         query: str,
-        *args,
-        timeout: Optional[float] = None,
+        args: Optional[Sequence] = None,
     ):
         """
         Executes an SQL query and returns the result status.
@@ -132,18 +203,17 @@ class ConnectionProxy:
         :param query: the SQL query to execute.
         :param args: the parameters to pass to the SQL query.
         :param timeout: the number of seconds to wait before timing out the SQL query.
-        :return: the result status of the SQL query.
+        :return: the rowcount of the SQL query.
         """
-        return await self.conn.execute(
-            query, *args, timeout=timeout  # type:ignore
-        )
+        async with self.cursor() as cursor:
+            return await cursor.execute(
+                query, args  # type:ignore
+            )
 
     async def executemany(
         self,
-        command: str,
+        query: str,
         args: Sequence[Sequence],
-        *,
-        timeout: Optional[float] = None,
     ):
         """
         Executes an SQL query and returns the result status.
@@ -153,37 +223,36 @@ class ConnectionProxy:
         :param timeout: the number of seconds to wait before timing out the SQL query.
         :return: the result status of the SQL query.
         """
-        return await self.conn.executemany(
-            command, args, timeout=timeout  # type:ignore
-        )
+        async with self.cursor() as cursor:
+            return await cursor.executemany(
+                query, args  # type:ignore
+            )
 
     async def fetch(
         self,
         query: str,
         *args,
-        timeout: Optional[float] = None,
-        record_class: type[RecordT] = None,
-    ) -> list[RecordT]:
+        cursor_class: type[Cursor] = Cursor,
+    ) -> list[Any]:
         """
         Executes an SQL query and returns the rows fetched as a list of records.
 
         :param query: the SQL query to execute.
         :param args: the parameters to pass to the SQL query.
         :param timeout: the number of seconds to wait before timing out the SQL query.
-        :param record_class: the class to be used on the record.
-        :return: a list of instances of `record_class`.
+        :param cursor_class: the class to be used on the cursor to make the records.
+        :return: a list of instances of `cursor_class` type.
         """
-        return await self.conn.fetch(
-            query, *args, timeout=timeout, record_class=record_class
-        )
+        async with self.cursor(cursor_class) as cursor:
+            await cursor.execute(query, args)
+            return await cursor.fetchall()
 
     async def fetchrow(
         self,
         query: str,
         *args,
-        timeout: Optional[float] = None,
-        record_class: type[RecordT] = None,
-    ) -> Optional[RecordT]:
+        cursor_class: type[Cursor] = Cursor,
+    ) -> Optional[Any]:
         """
         Executes an SQL query and returns the first row fetched as a record or None.
 
@@ -193,39 +262,34 @@ class ConnectionProxy:
         :param record_class: the class to be used on the record.
         :return: an instance `record_class`.
         """
-        return await self.conn.fetchrow(
-            query, *args, timeout=timeout, record_class=record_class
-        )
+        async with self.cursor(cursor_class) as cursor:
+            await cursor.execute(query, args)
+            return await cursor.fetchone()
 
 
-AsyncpgContext = AsyncContext[ConnectionProxy]
+AsyncmyContext = AsyncContext[ConnectionProxy]
 
 
 @define
-class AsyncpgAdapter(AtomicAsyncAdapter[ConnectionProxy]):
-    """An adapter for connecting to a PostgreSQL database using asyncpg."""
+class AsyncmyAdapter(AtomicAsyncAdapter[ConnectionProxy]):
+    """An adapter for connecting to a PostgreSQL database using aiomysql."""
 
     config: DatabaseConfig = info(default=db_config_factory)
 
-    @lazyfield
-    def uri(self):
-        """The URI for the database connection."""
-        return make_uri(
-            self.config,
-            self.config.port if self.config.port != -1 else DEFAULT_PORT,
-            "postgres",
-        )
-
     async def init(self):
         """Initialize the adapter by creating a connection pool."""
-        pool = asyncpg.create_pool(
-            self.uri,
-            max_size=self.config.pool_size + self.config.max_overflow,
-            max_inactive_connection_lifetime=self.config.pool_recycle,
+        pool = await asyncmy.create_pool(
+            maxsize=self.config.pool_size + self.config.max_overflow,
+            pool_recycle=self.config.pool_recycle,
+            host=self.config.host,
+            port=self.config.port if self.config.port != -1 else DEFAULT_PORT,
+            user=self.config.user,
+            password=self.config.password,
+            db=self.config.name,
+            autocommit=False,
         )
-        await pool  # pool._async_init can return none
-        AsyncpgAdapter.pool.manual_set(self, pool)
-        AsyncpgAdapter.initialized.manual_set(self, True)
+        AsyncmyAdapter.pool.manual_set(self, pool)
+        AsyncmyAdapter.initialized.manual_set(self, True)
 
     @lazyfield
     def pool(self) -> Pool:
@@ -245,7 +309,7 @@ class AsyncpgAdapter(AtomicAsyncAdapter[ConnectionProxy]):
         """Create a new database connection."""
         if not self.initialized:
             await self.init()
-        return ConnectionProxy(await self.pool.acquire())
+        return ConnectionProxy(await self.pool.acquire(), self.pool.release)
 
     async def release(self, client: ConnectionProxy) -> None:
         """Release a database connection."""
@@ -269,9 +333,7 @@ class AsyncpgAdapter(AtomicAsyncAdapter[ConnectionProxy]):
 
     def context(self):
         """Create a new context for using the adapter."""
-
-        ctx = AsyncpgContext(self)
-        return atomic(ctx) if self.config.autotransaction else ctx
+        return AsyncmyContext(self)
 
     async def dispose(self):
         """
@@ -287,6 +349,7 @@ class AsyncpgAdapter(AtomicAsyncAdapter[ConnectionProxy]):
             raise RuntimeError("Adapter is not initialized")
 
         pool = self.pool
-        await pool.close()
-        AsyncpgAdapter.pool.cleanup(self)
-        AsyncpgAdapter.initialized.manual_set(self, False)
+        pool.close()
+        await pool.wait_closed()
+        AsyncmyAdapter.pool.cleanup(self)
+        AsyncmyAdapter.initialized.manual_set(self, False)

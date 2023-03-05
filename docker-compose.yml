@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  pgdb:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+
+  mysdb:
+    image: mysql:latest
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: mypassword
+      MYSQL_DATABASE: mydb
+      MYSQL_USER: myuser
+      MYSQL_PASSWORD: mypassword
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.testing
+    environment:
+      PG_HOST: pgdb
+      PG_USER: myuser
+      PG_PASSWORD: mypassword
+      PG_NAME: mydb
+      MY_HOST: mysdb
+      MY_USER: myuser
+      MY_PASSWORD: mypassword
+      MY_NAME: mydb
+
+    depends_on:
+      - pgdb
+      - mysdb
